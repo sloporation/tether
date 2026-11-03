@@ -114,9 +114,18 @@ public final class TetherClient {
     }
 
     /// Pairs with a host at an endpoint (tests connect without Bonjour).
+    /// Cancelling the task hangs up, and the host stops asking.
     public func pair(endpoint: NWEndpoint, code: @MainActor (String) -> Void) async throws {
         let wire = WireConnection(NWConnection(to: endpoint, using: Wire.pairingParameters(configuration)))
         defer { wire.cancel() }
+        try await withTaskCancellationHandler {
+            try await pair(over: wire, code: code)
+        } onCancel: {
+            wire.cancel()
+        }
+    }
+
+    private func pair(over wire: WireConnection, code: @MainActor (String) -> Void) async throws {
         try await wire.start()
         let greeting = try await wire.receive(Wire.Greeting.self)
 
