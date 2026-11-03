@@ -222,6 +222,17 @@ public final class TetherHost {
                 }
                 await onSession?(session)
                 session.close()
+            case .status:
+                // Over the pairing identity: does this host still know the client?
+                // Answers yes or no only; no session is opened.
+                try await wire.send(statusReply(request, challenge: challenge))
+                wire.cancel()
+            case .unpair:
+                // The client forgot this host; forget it here too.
+                let reply = statusReply(request, challenge: challenge)
+                if reply.ok, let id = request.client { forget(id) }
+                try await wire.send(Wire.Reply(ok: true))
+                wire.cancel()
             case .reveal:
                 wire.cancel()
             }
@@ -287,6 +298,16 @@ public final class TetherHost {
             try await Task.sleep(for: .milliseconds(250))
         }
         try? await wire.send(Wire.Reply(ok: false, why: "\(name) didn't answer."))
+    }
+
+    private func statusReply(_ request: Wire.Request, challenge: Data) -> Wire.Reply {
+        guard let id = request.client, let proof = request.proof, let peer = peer(id), peer.allowed,
+              let key = keyStore.key(for: id),
+              Pairing.check(proof, challenge: challenge, client: id, key: key)
+        else {
+            return Wire.Reply(ok: false, unpaired: true)
+        }
+        return Wire.Reply(ok: true)
     }
 
     /// A paired client saying hello, proving who it is with its key.

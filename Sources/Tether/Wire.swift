@@ -16,7 +16,7 @@ enum Wire {
 
     /// The client's handshake messages.
     struct Request: Codable {
-        enum Op: String, Codable { case pair, reveal, hello }
+        enum Op: String, Codable { case pair, reveal, hello, status, unpair }
         var op: Op
         var client: String?
         var name: String?
@@ -90,8 +90,24 @@ final class WireConnection: @unchecked Sendable {
         self.connection = connection
     }
 
-    /// Starts the connection and waits until it can be used.
-    func start() async throws {
+    /// Starts the connection and waits until it can be used, giving up (and
+    /// cancelling it) after `timeout`.
+    func start(timeout: Duration = .seconds(10)) async throws {
+        let connection = self.connection
+        let watchdog = Task {
+            try await Task.sleep(for: timeout)
+            connection.cancel()     // → .cancelled → TetherError.closed
+        }
+        defer { watchdog.cancel() }
+        do {
+            try await waitUntilReady()
+        } catch {
+            connection.cancel()
+            throw error
+        }
+    }
+
+    private func waitUntilReady() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let once = Once(continuation)
             connection.stateUpdateHandler = { state in
@@ -136,6 +152,23 @@ final class WireConnection: @unchecked Sendable {
                 if let error {
                     continuation.resume(throwing: error)
                 } else if let data, data.count == count {
+                    continuation.resume(returning: data)
+                } else {
+                    continuation.resume(throwing: TetherError.closed)
+                }
+            }
+        }
+    }
+}
+
+extension WireConnection {
+    /// Whatever has arrived, at least one byte and at most `count`.
+    func receive(upTo count: Int) async throws -> Data {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+            connection.receive(minimumIncompleteLength: 1, maximumLength: count) { data, _, _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let data, !data.isEmpty {
                     continuation.resume(returning: data)
                 } else {
                     continuation.resume(throwing: TetherError.closed)

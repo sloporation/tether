@@ -114,9 +114,18 @@ public final class TetherClient {
     }
 
     /// Pairs with a host at an endpoint (tests connect without Bonjour).
+    /// Cancelling the task hangs up, and the host stops asking.
     public func pair(endpoint: NWEndpoint, code: @MainActor (String) -> Void) async throws {
         let wire = WireConnection(NWConnection(to: endpoint, using: Wire.pairingParameters(configuration)))
         defer { wire.cancel() }
+        try await withTaskCancellationHandler {
+            try await pair(over: wire, code: code)
+        } onCancel: {
+            wire.cancel()
+        }
+    }
+
+    private func pair(over wire: WireConnection, code: @MainActor (String) -> Void) async throws {
         try await wire.start()
         let greeting = try await wire.receive(Wire.Greeting.self)
 
@@ -139,6 +148,32 @@ public final class TetherClient {
         save()
     }
 
+    /// Forgets a host, and first tells it to forget this device if it's on
+    /// the network now (otherwise it's told next time this device connects
+    /// and is turned away, or the host's user removes it there).
+    public func unpair(from hostID: String) async {
+        if let host = discovered.first(where: { $0.id == hostID }) {
+            try? await sendUnpair(endpoint: host.endpoint, hostID: hostID)
+        }
+        forget(hostID)
+    }
+
+    /// Asks the host at `endpoint` to forget this device.
+    func sendUnpair(endpoint: NWEndpoint, hostID: String) async throws {
+        guard let key = keyStore.key(for: hostID) else { return }
+        let wire = WireConnection(NWConnection(to: endpoint, using: Wire.pairingParameters(configuration)))
+        defer { wire.cancel() }
+        try await wire.start(timeout: .seconds(5))
+        let greeting = try await wire.receive(Wire.Greeting.self)
+        guard greeting.host == hostID else { return }
+        try await wire.send(Wire.Request(
+            op: .unpair, client: clientID,
+            proof: Pairing.proof(challenge: greeting.challenge, client: clientID, key: key)
+        ))
+        _ = try await wire.receive(Wire.Reply.self)
+    }
+
+    /// Forgets a host on this device only.
     public func forget(_ hostID: String) {
         paired.removeAll { $0.id == hostID }
         keyStore.removeKey(for: hostID)
@@ -154,10 +189,53 @@ public final class TetherClient {
     }
 
     public func connect(endpoint: NWEndpoint, hostID: String) async throws -> TetherSession {
+        do {
+            return try await open(endpoint: endpoint, hostID: hostID)
+        } catch TetherError.unpaired {
+            throw TetherError.unpaired
+        } catch {
+            // The TLS handshake fails when the host no longer has this device's
+            // key, before it can say so. Ask over the pairing channel.
+            if await isStillPaired(endpoint: endpoint, hostID: hostID) == false {
+                forget(hostID)
+                throw TetherError.unpaired
+            }
+            throw error
+        }
+    }
+
+    /// Whether the host still knows this device: `nil` if it couldn't be asked.
+    func isStillPaired(endpoint: NWEndpoint, hostID: String) async -> Bool? {
+        guard let key = keyStore.key(for: hostID) else { return false }
+        let wire = WireConnection(NWConnection(to: endpoint, using: Wire.pairingParameters(configuration)))
+        defer { wire.cancel() }
+        do {
+            try await wire.start()
+            let greeting = try await wire.receive(Wire.Greeting.self)
+            guard greeting.host == hostID else { return nil }
+            try await wire.send(Wire.Request(
+                op: .status, client: clientID,
+                proof: Pairing.proof(challenge: greeting.challenge, client: clientID, key: key)
+            ))
+            let reply = try await wire.receive(Wire.Reply.self)
+            return reply.unpaired == true ? false : (reply.ok ? true : nil)
+        } catch {
+            return nil
+        }
+    }
+
+    private func open(endpoint: NWEndpoint, hostID: String) async throws -> TetherSession {
         guard let key = keyStore.key(for: hostID) else { throw TetherError.unpaired }
         let wire = WireConnection(NWConnection(to: endpoint, using: Wire.clientParameters(identity: clientID, key: key)))
         do {
             try await wire.start()
+            // A host that no longer has this device's key fails the TLS
+            // handshake, which can stall; don't wait on it forever.
+            let watchdog = Task {
+                try await Task.sleep(for: .seconds(10))
+                wire.cancel()       // the receive below then fails
+            }
+            defer { watchdog.cancel() }
             let greeting = try await wire.receive(Wire.Greeting.self)
             guard greeting.host == hostID else { throw TetherError.unexpectedHost }
             try await wire.send(Wire.Request(
@@ -186,3 +264,4 @@ public final class TetherClient {
         defaults.set(try? JSONEncoder().encode(paired), forKey: configuration.defaultsKey("hosts"))
     }
 }
+
