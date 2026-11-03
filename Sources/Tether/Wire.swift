@@ -16,7 +16,7 @@ enum Wire {
 
     /// The client's handshake messages.
     struct Request: Codable {
-        enum Op: String, Codable { case pair, reveal, hello }
+        enum Op: String, Codable { case pair, reveal, hello, status, unpair }
         var op: Op
         var client: String?
         var name: String?
@@ -90,8 +90,24 @@ final class WireConnection: @unchecked Sendable {
         self.connection = connection
     }
 
-    /// Starts the connection and waits until it can be used.
-    func start() async throws {
+    /// Starts the connection and waits until it can be used, giving up (and
+    /// cancelling it) after `timeout`.
+    func start(timeout: Duration = .seconds(10)) async throws {
+        let connection = self.connection
+        let watchdog = Task {
+            try await Task.sleep(for: timeout)
+            connection.cancel()     // → .cancelled → TetherError.closed
+        }
+        defer { watchdog.cancel() }
+        do {
+            try await waitUntilReady()
+        } catch {
+            connection.cancel()
+            throw error
+        }
+    }
+
+    private func waitUntilReady() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let once = Once(continuation)
             connection.stateUpdateHandler = { state in

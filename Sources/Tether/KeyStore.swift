@@ -11,6 +11,12 @@ public protocol TetherKeyStore: Sendable {
 
 /// Keys in the Keychain, readable after the device's first unlock (so a sync
 /// can run while it's locked).
+/// Keys in the data protection keychain, readable after the device's first
+/// unlock (so a sync can run while it's locked). On macOS that keychain needs
+/// the app to have a `keychain-access-groups` entitlement, and its items
+/// survive rebuilds and updates; without the entitlement (e.g. `swift test`)
+/// keys fall back to the login keychain, whose items are tied to the exact
+/// build that saved them.
 public struct KeychainKeyStore: TetherKeyStore {
     public let service: String
 
@@ -19,42 +25,57 @@ public struct KeychainKeyStore: TetherKeyStore {
     }
 
     public func key(for peer: String) -> SymmetricKey? {
-        var query = baseQuery(peer)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data else {
-            return nil
+        for dataProtection in Self.keychains {
+            var query = baseQuery(peer, dataProtection: dataProtection)
+            query[kSecReturnData as String] = true
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+            var result: CFTypeRef?
+            if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data {
+                return SymmetricKey(data: data)
+            }
         }
-        return SymmetricKey(data: data)
+        return nil
     }
 
     public func setKey(_ key: SymmetricKey, for peer: String) {
         removeKey(for: peer)
-        var item = baseQuery(peer)
-        item[kSecValueData as String] = key.data
-        #if !os(macOS)
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        #endif
-        let status = SecItemAdd(item as CFDictionary, nil)
+        var status = errSecMissingEntitlement
+        for dataProtection in Self.keychains {
+            var item = baseQuery(peer, dataProtection: dataProtection)
+            item[kSecValueData as String] = key.data
+            if dataProtection {
+                item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            }
+            status = SecItemAdd(item as CFDictionary, nil)
+            if status != errSecMissingEntitlement { break }
+        }
         assert(status == errSecSuccess, "Tether couldn't store a key in the Keychain (OSStatus \(status))")
     }
 
     public func removeKey(for peer: String) {
-        SecItemDelete(baseQuery(peer) as CFDictionary)
+        for dataProtection in Self.keychains {
+            SecItemDelete(baseQuery(peer, dataProtection: dataProtection) as CFDictionary)
+        }
     }
 
-    private func baseQuery(_ peer: String) -> [String: Any] {
+    /// The data protection keychain, then (macOS only) the login keychain.
+    private static var keychains: [Bool] {
+        #if os(macOS)
+        [true, false]
+        #else
+        [true]
+        #endif
+    }
+
+    private func baseQuery(_ peer: String, dataProtection: Bool) -> [String: Any] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: peer,
         ]
-        #if os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
-        query[kSecUseDataProtectionKeychain as String] = true
-        #endif
-        // On macOS the data protection keychain needs a keychain-access-groups
-        // entitlement; the login keychain works for any app, sandboxed or not.
+        if dataProtection {
+            query[kSecUseDataProtectionKeychain as String] = true
+        }
         return query
     }
 }

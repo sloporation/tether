@@ -59,6 +59,12 @@ private struct Ping: Codable, Equatable { var text: String }
         return (host, .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!))
     }
 
+    /// Where the host is listening now (it can change port when it restarts
+    /// with a new client's key; real clients find it again through Bonjour).
+    private func currentEndpoint(of host: TetherHost) throws -> NWEndpoint {
+        .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: try #require(host.port))!)
+    }
+
     private func makeClient() -> TetherClient {
         TetherClient(configuration: configuration, name: "Test iPhone", keyStore: MemoryKeyStore(), defaults: freshDefaults())
     }
@@ -98,7 +104,7 @@ private struct Ping: Codable, Equatable { var text: String }
         #expect(client.isPaired(host.hostID))
         #expect(host.peer(client.clientID)?.allowed == true)
 
-        let session = try await client.connect(endpoint: endpoint, hostID: host.hostID)
+        let session = try await client.connect(endpoint: try currentEndpoint(of: host), hostID: host.hostID)
         defer { session.close() }
         try await session.send(Ping(text: "hi"))
         let reply = try await session.receive(Ping.self)
@@ -123,6 +129,21 @@ private struct Ping: Codable, Equatable { var text: String }
         }
     }
 
+    @Test func unpairingFromTheClientRemovesItFromTheHost() async throws {
+        let (host, endpoint) = try await makeHost()
+        defer { host.stop() }
+        let client = makeClient()
+        _ = try await pair(client, with: host, at: endpoint, allow: true)
+        #expect(host.peer(client.clientID)?.allowed == true)
+
+        // unpair(from:) finds the host through Bonjour; tests call the same
+        // request over the loopback endpoint.
+        try await client.sendUnpair(endpoint: try currentEndpoint(of: host), hostID: host.hostID)
+        client.forget(host.hostID)
+        #expect(host.peer(client.clientID) == nil)
+        #expect(!client.isPaired(host.hostID))
+    }
+
     @Test func forgottenClientIsToldToPairAgain() async throws {
         let (host, endpoint) = try await makeHost()
         defer { host.stop() }
@@ -132,8 +153,11 @@ private struct Ping: Codable, Equatable { var text: String }
         host.forget(client.clientID)
         try await Task.sleep(for: .milliseconds(300))      // listener restarts without its key
 
-        await #expect(throws: (any Error).self) {
-            _ = try await client.connect(endpoint: endpoint, hostID: host.hostID)
+        let current = try currentEndpoint(of: host)
+        await #expect(throws: TetherError.unpaired) {
+            _ = try await client.connect(endpoint: current, hostID: host.hostID)
         }
+        // …and it forgets the host, so the app can offer to pair again.
+        #expect(!client.isPaired(host.hostID))
     }
 }
