@@ -112,6 +112,27 @@ private struct Ping: Codable, Equatable { var text: String }
         #expect(host.peer(client.clientID)?.lastSeen != nil)
     }
 
+    @Test func sendsRawBytesAfterAMessage() async throws {
+        let (host, endpoint) = try await makeHost()
+        defer { host.stop() }
+        let file = Data((0..<3_000_000).map { UInt8($0 % 251) })
+        host.onSession = { session in
+            try? await session.send(Ping(text: "\(file.count)"))
+            try? await session.send(bytes: file)
+            _ = try? await session.receive(Ping.self)
+        }
+        let client = makeClient()
+        _ = try await pair(client, with: host, at: endpoint, allow: true)
+        let session = try await client.connect(endpoint: try currentEndpoint(of: host), hostID: host.hostID)
+        defer { session.close() }
+        let size = try #require(Int64(try await session.receive(Ping.self).text))
+        let url = FileManager.default.temporaryDirectory.appending(path: "tether-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await session.receiveFile(size: size, to: url)
+        #expect(try Data(contentsOf: url) == file)
+        try await session.send(Ping(text: "done"))
+    }
+
     @Test func refusedClientIsNotPaired() async throws {
         let (host, endpoint) = try await makeHost()
         defer { host.stop() }

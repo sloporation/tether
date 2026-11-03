@@ -18,7 +18,8 @@ and receives any `Codable` messages.
 - **Connecting.** TLS 1.2 with a pre-shared key per paired device (`TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256`,
   so a key found later can't open traffic recorded before). The host greets with a random challenge; the
   client proves which device it is with an HMAC of it. Keys are stored in the Keychain.
-- **Messages.** A 4-byte big-endian length, then that much JSON.
+- **Messages.** A 4-byte big-endian length, then that much JSON. For something large, such as a file, send a message
+  that says how many bytes follow, then `send(bytes:)`; the other side reads them with `receiveFile(size:to:)`.
 
 ## Using it
 

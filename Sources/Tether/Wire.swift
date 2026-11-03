@@ -161,6 +161,23 @@ final class WireConnection: @unchecked Sendable {
     }
 }
 
+extension WireConnection {
+    /// Whatever has arrived, at least one byte and at most `count`.
+    func receive(upTo count: Int) async throws -> Data {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+            connection.receive(minimumIncompleteLength: 1, maximumLength: count) { data, _, _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let data, !data.isEmpty {
+                    continuation.resume(returning: data)
+                } else {
+                    continuation.resume(throwing: TetherError.closed)
+                }
+            }
+        }
+    }
+}
+
 /// A continuation resumed at most once (the state handler keeps being called).
 private final class Once: @unchecked Sendable {
     private var continuation: CheckedContinuation<Void, Error>?
